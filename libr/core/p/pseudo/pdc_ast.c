@@ -553,16 +553,23 @@ static bool proof_step(RReg *regs, PdcProof *p, RAnalOp *op) {
 		return true;
 	}
 	if (type == R_ANAL_OP_TYPE_MOV) {
-		if (sscanf (esil, "%31[^,],%31[^,],=%n", a, b, &end) != 2
-				|| !end || esil[end]) {
-			return false;
-		}
 		ut64 value;
-		if (!proof_number (a, &value)) {
-			return false;
+		if (sscanf (esil, "%31[^,],%31[^,],=%n", a, b, &end) == 2
+				&& end && !esil[end] && proof_number (a, &value)) {
+			proof_register (regs, p, b, value);
+			if (p->reg) {
+				return true;
+			}
 		}
-		proof_register (regs, p, b, value);
-		return p->reg != NULL;
+		// Unmodelled moves and LEAs preserve x86 ZF, not tracked values.
+		r_unref (p->reg);
+		p->reg = NULL;
+		return true;
+	}
+	if (type == R_ANAL_OP_TYPE_LEA) {
+		r_unref (p->reg);
+		p->reg = NULL;
+		return true;
 	}
 	if (type == R_ANAL_OP_TYPE_XOR) {
 		if (!op->mnemonic || sscanf (op->mnemonic, "xor %31[^,], %31s%n", a, b, &end) != 2
