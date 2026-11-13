@@ -47,6 +47,7 @@ static inline bool valid_addr(ut64 addr) {
 typedef struct {
 	PdcRegion *root;
 	bool complete;	// false when a two-way block heads no region: must use the linear pass
+	HtUU *reachable; // optional set of addresses reachable through known CFG edges
 } PdcPlan;
 
 // build the structuring plan for fcn (caller frees with pdc_plan_free)

@@ -310,3 +310,60 @@ seq 0x00000000
   bb 0x00000040
 EOF
 RUN
+
+NAME=pdct optionally omits blocks unreachable in the known CFG
+FILE=malloc://128
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+af+ 0 0 dead_junk
+afb+ 0 0 4 0xffffffffffffffff 0x10
+afb+ 0 0x10 4
+afb+ 0 0x20 4
+pdct
+?e --
+e pdc.reachable=true
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  seq 0x00000000
+    bb 0x00000000
+    bb 0x00000010
+  bb 0x00000020
+--
+seq 0x00000000
+  bb 0x00000000
+  bb 0x00000010
+EOF
+RUN
+
+NAME=pdc reachable mode omits orphan instruction bodies
+FILE=malloc://128
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e scr.color=false
+e pdc.optimize=false
+af+ 0 0 dead_junk
+afb+ 0 0 4 0xffffffffffffffff 0x10
+afb+ 0 0x10 4
+afb+ 0 0x20 4
+pdc~byte
+?e --
+e pdc.reachable=true
+pdc~byte
+EOF
+EXPECT=<<EOF
+    byte [rax] += al
+    byte [rax] += al
+    byte [rax] += al
+    byte [rax] += al
+    byte [rax] += al
+    byte [rax] += al
+--
+    byte [rax] += al
+    byte [rax] += al
+    byte [rax] += al
+    byte [rax] += al
+EOF
+RUN

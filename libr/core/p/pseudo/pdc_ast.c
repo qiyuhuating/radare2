@@ -21,6 +21,7 @@ typedef struct {
 	HtUP *loops;	// natural-loop header addr => HtUU* member set
 	HtUU *cur_loop;	// members of the innermost loop being walked (NULL outside one)
 	HtUU *emitted;	// block addr => 1 (each block heads a region at most once)
+	HtUU *reachable; // opt-in: only emit nodes reachable via known CFG edges
 	int build_calls;
 	int cap;
 } PdcCtx;
@@ -418,22 +419,34 @@ static void classify_transfers(PdcRegion *r, const PdcScope *scope) {
 void pdc_plan_free(PdcPlan *plan) {
 	if (plan) {
 		region_free (plan->root);
+		ht_uu_free (plan->reachable);
 		free (plan);
 	}
 }
 
 // a two-way block left to the orphan pass would lose one of its successors
-static bool blocks_are_owned(RAnalFunction *fcn, HtUU *emitted) {
+static bool blocks_are_owned(RAnalFunction *fcn, HtUU *emitted, HtUU *reachable) {
 	RAnalBlock **it;
 	RAnalBlock *bb;
 	R_VEC_FOREACH (&fcn->bbs, it) {
 		bb = *it;
+		if (reachable && !htuu_get (reachable, bb->addr, 0)) {
+			continue;
+		}
 		if (bb->jump != UT64_MAX && bb->fail != UT64_MAX
 				&& !htuu_get (emitted, bb->addr, 0)) {
 			return false;
 		}
 	}
 	return true;
+}
+
+static void mark_reachable(RGraphNode *n, RGraphVisitor *vis) {
+	PdcCtx *ctx = vis->data;
+	RAnalBlock *bb = n->data;
+	if (bb) {
+		ht_uu_update (ctx->reachable, bb->addr, 1);
+	}
 }
 
 PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
@@ -454,12 +467,28 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 		.ipdom = ht_uu_new0 (),
 		.loops = ht_up_new0 (),
 		.emitted = ht_uu_new0 (),
+		.reachable = r_config_get_b (core->config, "pdc.reachable")? ht_uu_new0 (): NULL,
 		.cap = 4 * (int)RVecAnalBlockPtr_length (&fcn->bbs) + 64
 	};
 
 	// Acyclic CFGs never need a dominator tree for natural-loop detection.
-	RGraphVisitor vis = { .back_edge = back_edge_cb, .data = &ctx };
+	RGraphVisitor vis = { .back_edge = back_edge_cb,
+		.discover_node = ctx.reachable? mark_reachable: NULL, .data = &ctx };
 	r_graph_dfs_node (g, entry, &vis);
+	if (ctx.reachable) {
+		RVecGraphNodePtr unreachable;
+		RVecGraphNodePtr_init (&unreachable);
+		RListIter *it;
+		RGraphNode *n;
+		r_list_foreach (g->nodes, it, n) {
+			RAnalBlock *bb = n->data;
+			if (!htuu_get (ctx.reachable, bb->addr, 0)) {
+				RVecGraphNodePtr_push_back (&unreachable, &n);
+			}
+		}
+		r_graph_del_nodes (g, &unreachable);
+		RVecGraphNodePtr_fini (&unreachable);
+	}
 
 	// add a virtual sink (addr UT64_MAX reads as "past function exit") so
 	// post-dominance is well-defined on multi-exit functions
@@ -492,7 +521,8 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 		PdcRegion *extra = NULL;
 		R_VEC_FOREACH (&fcn->bbs, bit) {
 			b = *bit;
-			if (htuu_get (ctx.emitted, b->addr, 0)) {
+			if ((ctx.reachable && !htuu_get (ctx.reachable, b->addr, 0))
+					|| htuu_get (ctx.emitted, b->addr, 0)) {
 				continue;
 			}
 			PdcRegion *r = region_seq (&ctx, b->addr, UT64_MAX);
@@ -520,7 +550,8 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 	}
 	PdcPlan *plan = R_NEW0 (PdcPlan);
 	plan->root = root;
-	plan->complete = blocks_are_owned (fcn, ctx.emitted);
+	plan->complete = blocks_are_owned (fcn, ctx.emitted, ctx.reachable);
+	plan->reachable = ctx.reachable;
 	ht_uu_free (ctx.emitted);
 	return plan;
 }

@@ -2372,6 +2372,17 @@ static bool pdc_structured_body(PDCState *state, int indent) {
 		collect_goto_targets (state, root, gotos);
 		render_region (state, root, indent, gotos, UT64_MAX);
 		r_bitset_free (gotos);
+		if (plan->reachable) {
+			// Only opt-in: unresolved indirect jumps may hide real CFG edges.
+			RAnalBlock **it;
+			R_VEC_FOREACH (&state->fcn->bbs, it) {
+				bool found = false;
+				ht_uu_find (plan->reachable, (*it)->addr, &found);
+				if (!found) {
+					r_bitset_set (state->marked, (*it)->addr);
+				}
+			}
+		}
 		state->structured = was_structured;
 	}
 	ht_up_free (state->conds);
