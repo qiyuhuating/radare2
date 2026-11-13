@@ -748,3 +748,40 @@ seq 0x00000000
   bb 0x0000000e
 EOF
 RUN
+
+NAME=pdct proof preserves ZF across x86 conditional move
+FILE=malloc://128
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx 39c00f44ca7405b801000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  bb 0x0000000c
+EOF
+RUN
+
+NAME=pdct proof invalidates register values after conditional move
+FILE=malloc://128
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx b8010000000f45c383f8017405b802000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  if 0x00000000
+    bb 0x0000000d
+  bb 0x00000012
+EOF
+RUN

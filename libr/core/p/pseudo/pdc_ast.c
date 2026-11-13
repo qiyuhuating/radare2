@@ -569,12 +569,13 @@ static bool proof_step(RReg *regs, PdcProof *p, RAnalOp *op) {
 				return true;
 			}
 		}
-		// Unmodelled moves and LEAs preserve x86 ZF, not tracked values.
+		// Unmodelled MOV operands preserve x86 ZF, not tracked values.
 		r_unref (p->reg);
 		p->reg = NULL;
 		return true;
 	}
-	if (type == R_ANAL_OP_TYPE_LEA) {
+	if (type == R_ANAL_OP_TYPE_LEA || type == R_ANAL_OP_TYPE_CMOV) {
+		// Neither instruction changes ZF; either may invalidate register values.
 		r_unref (p->reg);
 		p->reg = NULL;
 		return true;
