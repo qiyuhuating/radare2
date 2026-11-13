@@ -367,3 +367,210 @@ EXPECT=<<EOF
     byte [rax] += al
 EOF
 RUN
+
+NAME=pdct proves reflexive comparison without assuming register inputs
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+wx 39c07405b801000000c3 @ 0
+af @ 0
+e pdc.reachable=true
+pdct
+?e --
+e pdc.prove=true
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  if 0x00000000
+    bb 0x00000004
+  bb 0x00000009
+--
+seq 0x00000000
+  bb 0x00000000
+  bb 0x00000009
+EOF
+RUN
+
+NAME=pdct bounded local constant propagation proves equal and unequal branches
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx b80100000083f8017405b802000000c3 @ 0
+af @ 0
+pdct
+?e --
+af- @ 0
+wx b80100000083f8027405b802000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  bb 0x0000000f
+--
+seq 0x00000000
+  bb 0x00000000
+  bb 0x0000000a
+  bb 0x0000000f
+EOF
+RUN
+
+NAME=pdct proves xor and test zero without assuming live input values
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx 31c085c07405b801000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  bb 0x0000000b
+EOF
+RUN
+
+NAME=pdct retains unknown test branch with proof enabled
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx 85c07405b801000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  if 0x00000000
+    bb 0x00000004
+  bb 0x00000009
+EOF
+RUN
+
+NAME=pdc proof is disabled without reachable mode
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.prove=true
+wx 39c07405b801000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  if 0x00000000
+    bb 0x00000004
+  bb 0x00000009
+EOF
+RUN
+
+NAME=pdc proven branch removes false conditional but unknown branch stays
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e scr.color=false
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx b80100000083f8017405b802000000c3 @ 0
+af @ 0
+pdc~if
+?e --
+af- @ 0
+wx 85c07405b801000000c3 @ 0
+af @ 0
+pdc~if
+EOF
+EXPECT=<<EOF
+--
+    if (eax & eax) {
+EOF
+RUN
+
+NAME=pdct bounded proof keeps cross-block unknown state
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx b801000000eb05909090909083f8017405b802000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  if 0x0000000c
+    bb 0x00000011
+  bb 0x00000016
+EOF
+RUN
+
+NAME=pdct bounded proof preserves branch after unsupported flag clobber
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx 31c001d885c07405b801000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  if 0x00000000
+    bb 0x00000008
+  bb 0x0000000d
+EOF
+RUN
+
+NAME=pdct bounded proof preserves branch after a call
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx 31c0e80000000085c07405b801000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  if 0x00000000
+    bb 0x0000000b
+  bb 0x00000010
+EOF
+RUN
+
+NAME=pdct mov after comparison preserves established zero flag
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx 39c0b9010000007405b801000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  bb 0x0000000e
+EOF
+RUN

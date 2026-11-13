@@ -7,6 +7,7 @@
 
 #include <r_core.h>
 #include "pdc_ast.h"
+#include <errno.h>
 
 typedef struct {
 	RAnal *anal;
@@ -22,6 +23,7 @@ typedef struct {
 	HtUU *cur_loop;	// members of the innermost loop being walked (NULL outside one)
 	HtUU *emitted;	// block addr => 1 (each block heads a region at most once)
 	HtUU *reachable; // opt-in: only emit nodes reachable via known CFG edges
+	HtUU *decisions; // proven branch block address => surviving target
 	int build_calls;
 	int cap;
 } PdcCtx;
@@ -302,6 +304,11 @@ static PdcRegion *build_region(PdcCtx *ctx, ut64 cur, ut64 stop, ut64 *next) {
 		return region_new (PDC_R_GOTO, cur);
 	}
 	ht_uu_update (ctx->emitted, cur, 1);
+	const ut64 decided = ctx->decisions? htuu_get (ctx->decisions, cur, UT64_MAX): UT64_MAX;
+	if (decided != UT64_MAX) {
+		*next = decided;
+		return region_new (PDC_R_BB, cur);
+	}
 
 	HtUU *loop_set = ht_up_find (ctx->loops, cur, NULL);
 	if (loop_set) {
@@ -449,6 +456,164 @@ static void mark_reachable(RGraphNode *n, RGraphVisitor *vis) {
 	}
 }
 
+// Prove only local x86 zero-flag branches; unmodelled instructions are unknown.
+typedef struct {
+	RRegItem *reg; // ref-counted; released at the end of the proof
+	ut64 value;
+	bool zf_known;
+	bool zf;
+} PdcProof;
+
+static bool proof_number(const char *text, ut64 *out) {
+	if (!text || !*text) {
+		return false;
+	}
+	char *end;
+	errno = 0;
+	const ut64 n = strtoull (text, &end, 0);
+	if (errno || end == text || *end) {
+		return false;
+	}
+	*out = n;
+	return true;
+}
+
+static bool proof_value(RReg *regs, PdcProof *p, const char *s, ut64 *value) {
+	if (proof_number (s, value)) {
+		return true;
+	}
+	RRegItem *reg = r_reg_get (regs, s, -1);
+	if (!reg) {
+		return false;
+	}
+	const bool known = p->reg && reg->arena == p->reg->arena
+		&& reg->offset == p->reg->offset && reg->size > 0
+		&& reg->size <= p->reg->size && reg->size <= 64;
+	if (known) {
+		*value = p->value & (reg->size == 64? UT64_MAX: (UT64_MAX >> (64 - reg->size)));
+	}
+	r_unref (reg);
+	return known;
+}
+
+static void proof_register(RReg *regs, PdcProof *p, const char *name, ut64 value) {
+	r_unref (p->reg);
+	p->reg = r_reg_get (regs, name, -1);
+	p->value = value;
+}
+
+static bool proof_step(RReg *regs, PdcProof *p, RAnalOp *op) {
+	const char *esil = r_strbuf_get (&op->esil);
+	char a[32], b[32];
+	int end = 0;
+	const int type = op->type & R_ANAL_OP_TYPE_MASK;
+	if (type == R_ANAL_OP_TYPE_NOP) {
+		return true;
+	}
+	if (type == R_ANAL_OP_TYPE_MOV) {
+		if (sscanf (esil, "%31[^,],%31[^,],=%n", a, b, &end) != 2
+				|| !end || esil[end]) {
+			return false;
+		}
+		ut64 value;
+		if (!proof_number (a, &value)) {
+			return false;
+		}
+		proof_register (regs, p, b, value);
+		return p->reg != NULL;
+	}
+	if (type == R_ANAL_OP_TYPE_XOR) {
+		if (!op->mnemonic || sscanf (op->mnemonic, "xor %31[^,], %31s%n", a, b, &end) != 2
+				|| !end || op->mnemonic[end] || strcmp (a, b)) {
+			return false;
+		}
+		proof_register (regs, p, a, 0);
+		p->zf_known = p->reg != NULL;
+		p->zf = true;
+		return p->zf_known;
+	}
+	if (type == R_ANAL_OP_TYPE_CMP) {
+		if (sscanf (esil, "%31[^,],%31[^,],==,$z,zf,:=%n", a, b, &end) != 2 || !end) {
+			return false;
+		}
+		RRegItem *same = !strcmp (a, b)? r_reg_get (regs, a, -1): NULL;
+		p->zf_known = same != NULL;
+		r_unref (same);
+		if (p->zf_known) {
+			p->zf = true;
+		} else {
+			ut64 x, y;
+			p->zf_known = proof_value (regs, p, a, &x) && proof_value (regs, p, b, &y);
+			if (p->zf_known) {
+				p->zf = x == y;
+			}
+		}
+		return true;
+	}
+	if (type == R_ANAL_OP_TYPE_ACMP) {
+		if (sscanf (esil, "0,%31[^,],%31[^,],&,==,$z,zf,:=%n", a, b, &end) != 2 || !end) {
+			return false;
+		}
+		ut64 x, y;
+		const bool kx = proof_value (regs, p, a, &x);
+		const bool ky = proof_value (regs, p, b, &y);
+		p->zf_known = (kx && !x) || (ky && !y) || (kx && ky);
+		if (p->zf_known) {
+			p->zf = (kx && !x) || (ky && !y) || !(x & y);
+		}
+		return true;
+	}
+	return false;
+}
+
+// A failed proof never changes the CFG. Each candidate has a strict instruction budget.
+static bool proof_branch(RCore *core, RAnalBlock *bb, bool *taken) {
+	if (strcmp (r_config_get (core->config, "asm.arch"), "x86")
+			|| (r_config_get_i (core->config, "asm.bits") != 64
+				&& r_config_get_i (core->config, "asm.bits") != 32)
+			|| bb->jump == UT64_MAX || bb->fail == UT64_MAX
+			|| bb->jump == bb->fail || bb->switch_op || bb->size > 192) {
+		return false;
+	}
+	PdcProof p = {0};
+	bool proved = false;
+	ut64 off = 0;
+	for (int i = 0; i < 32 && off < bb->size; i++) {
+		RAnalOp *op = r_core_anal_op (core, bb->addr + off,
+			R_ARCH_OP_MASK_ESIL | R_ARCH_OP_MASK_DISASM);
+		if (!op || op->size < 1 || op->size > bb->size - off || op->delay) {
+			r_anal_op_free (op);
+			break;
+		}
+		off += op->size;
+		const int type = op->type & R_ANAL_OP_TYPE_MASK;
+		if (type == R_ANAL_OP_TYPE_CJMP && off == bb->size
+				&& op->jump == bb->jump && op->fail == bb->fail && p.zf_known) {
+			const char *s = r_strbuf_get (&op->esil);
+			const bool negated = r_str_startswith (s, "zf,!,?{,");
+			const char *start = negated? s + 8: (r_str_startswith (s, "zf,?{,")? s + 6: NULL);
+			ut64 target;
+			char *end;
+			if (start) {
+				target = strtoull (start, &end, 0);
+				if (end != start && !strcmp (end, ",rip,=,}") && target == op->jump) {
+					*taken = negated? !p.zf: p.zf;
+					proved = true;
+				}
+			}
+		} else if (type != R_ANAL_OP_TYPE_CJMP && !proof_step (core->anal->reg, &p, op)) {
+			r_anal_op_free (op);
+			break;
+		}
+		r_anal_op_free (op);
+		if (proved) {
+			break;
+		}
+	}
+	r_unref (p.reg);
+	return proved;
+}
+
 PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 	R_RETURN_VAL_IF_FAIL (core && fcn, NULL);
 	RGraphNode *entry = NULL;
@@ -468,8 +633,38 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 		.loops = ht_up_new0 (),
 		.emitted = ht_uu_new0 (),
 		.reachable = r_config_get_b (core->config, "pdc.reachable")? ht_uu_new0 (): NULL,
+		.decisions = r_config_get_b (core->config, "pdc.prove")
+			&& r_config_get_b (core->config, "pdc.reachable")? ht_uu_new0 (): NULL,
 		.cap = 4 * (int)RVecAnalBlockPtr_length (&fcn->bbs) + 64
 	};
+
+	if (ctx.decisions) {
+		RListIter *it;
+		RGraphNode *n;
+		r_list_foreach (g->nodes, it, n) {
+			RAnalBlock *bb = n->data;
+			bool taken;
+			if (!proof_branch (core, bb, &taken)) {
+				continue;
+			}
+			const ut64 target = taken? bb->jump: bb->fail;
+			const ut64 discarded = taken? bb->fail: bb->jump;
+			RGraphNode *kept = NULL, *dropped = NULL;
+			RGraphNode **child;
+			R_VEC_FOREACH (&n->out_nodes, child) {
+				RAnalBlock *successor = (*child)->data;
+				if (successor->addr == target) {
+					kept = *child;
+				} else if (successor->addr == discarded) {
+					dropped = *child;
+				}
+			}
+			if (kept && dropped) {
+				r_graph_del_edge (g, n, dropped);
+				ht_uu_update (ctx.decisions, bb->addr, target);
+			}
+		}
+	}
 
 	// Acyclic CFGs never need a dominator tree for natural-loop detection.
 	RGraphVisitor vis = { .back_edge = back_edge_cb,
@@ -543,6 +738,7 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 	ht_uu_free (ctx.dom_pre);
 	ht_uu_free (ctx.dom_post);
 	ht_uu_free (ctx.ipdom);
+	ht_uu_free (ctx.decisions);
 	ht_up_foreach (ctx.loops, free_loop_set_cb, NULL);
 	ht_up_free (ctx.loops);
 	if (root) {
