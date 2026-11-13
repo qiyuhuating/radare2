@@ -639,3 +639,57 @@ seq 0x00000000
   bb 0x00000030
 EOF
 RUN
+
+NAME=pdct proof compares sign-extended imm8 at 32-bit register width
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx b8ffffffff83f8ff7405b802000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  bb 0x0000000f
+EOF
+RUN
+
+NAME=pdct proof handles a different negative immediate at 32-bit width
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx b8feffffff83f8fe7405b802000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  bb 0x0000000f
+EOF
+RUN
+
+NAME=pdct proof preserves a 64-bit negative comparison
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+e pdc.reachable=true
+e pdc.prove=true
+wx 48c7c0ffffffff4883f8ff7405b802000000c3 @ 0
+af @ 0
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  bb 0x00000012
+EOF
+RUN

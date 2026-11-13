@@ -528,6 +528,16 @@ static bool proof_value(RReg *regs, PdcProof *p, const char *s, ut64 *value) {
 	return known;
 }
 
+static int proof_register_bits(RReg *regs, const char *name) {
+	RRegItem *reg = r_reg_get (regs, name, -1);
+	if (!reg) {
+		return 0;
+	}
+	const int bits = reg->size;
+	r_unref (reg);
+	return bits > 0 && bits <= 64? bits: 0;
+}
+
 static void proof_register(RReg *regs, PdcProof *p, const char *name, ut64 value) {
 	r_unref (p->reg);
 	p->reg = r_reg_get (regs, name, -1);
@@ -574,10 +584,17 @@ static bool proof_step(RReg *regs, PdcProof *p, RAnalOp *op) {
 		if (p->zf_known) {
 			p->zf = true;
 		} else {
+			// x86 comparisons use the register operand's width. ESIL can
+			// sign-extend an imm8 to 64 bits even for a 32-bit CMP.
+			const int abits = proof_register_bits (regs, a);
+			const int bbits = proof_register_bits (regs, b);
+			const int bits = abits? abits: bbits;
 			ut64 x, y;
-			p->zf_known = proof_value (regs, p, a, &x) && proof_value (regs, p, b, &y);
+			p->zf_known = bits && (!abits || !bbits || abits == bbits)
+				&& proof_value (regs, p, a, &x) && proof_value (regs, p, b, &y);
 			if (p->zf_known) {
-				p->zf = x == y;
+				const ut64 mask = bits == 64? UT64_MAX: UT64_MAX >> (64 - bits);
+				p->zf = (x & mask) == (y & mask);
 			}
 		}
 		return true;
