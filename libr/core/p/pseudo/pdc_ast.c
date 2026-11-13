@@ -24,6 +24,7 @@ typedef struct {
 	HtUU *emitted;	// block addr => 1 (each block heads a region at most once)
 	HtUU *reachable; // opt-in: only emit nodes reachable via known CFG edges
 	HtUU *decisions; // proven branch block address => surviving target
+	HtUP *owned; // exact function block addresses, optional pruning mode
 	int build_calls;
 	int cap;
 } PdcCtx;
@@ -298,9 +299,10 @@ static PdcRegion *build_region(PdcCtx *ctx, ut64 cur, ut64 stop, ut64 *next) {
 	if (++ctx->build_calls > ctx->cap || htuu_get (ctx->emitted, cur, 0)) {
 		return region_new (PDC_R_GOTO, cur);
 	}
-	RAnalBlock *bb = r_anal_get_block_at (ctx->anal, cur);
-	// a tail call or a jump into a neighbour would splice its blocks in here
-	if (!bb || !r_anal_function_contains (ctx->fcn, cur)) {
+	RAnalBlock *bb = ctx->owned? ht_up_find (ctx->owned, cur, NULL): r_anal_get_block_at (ctx->anal, cur);
+	// Only exact block starts owned by this function qualify in pruning mode.
+	if (!bb || (!ctx->owned && !r_anal_function_contains (ctx->fcn, cur))
+			|| (ctx->reachable && !htuu_get (ctx->reachable, cur, 0))) {
 		return region_new (PDC_R_GOTO, cur);
 	}
 	ht_uu_update (ctx->emitted, cur, 1);
@@ -453,6 +455,36 @@ static void mark_reachable(RGraphNode *n, RGraphVisitor *vis) {
 	RAnalBlock *bb = n->data;
 	if (bb) {
 		ht_uu_update (ctx->reachable, bb->addr, 1);
+	}
+}
+
+// Landing pads and filters have exceptional incoming edges absent from the CFG.
+static void mark_exception_entry(PdcCtx *ctx, ut64 addr) {
+	if (!valid_addr (addr)) {
+		return;
+	}
+	RListIter *it;
+	RGraphNode *n;
+	r_list_foreach (ctx->cfg->nodes, it, n) {
+		RAnalBlock *bb = n->data;
+		if (addr >= bb->addr && addr - bb->addr < bb->size) {
+			RGraphVisitor reach = { .discover_node = mark_reachable, .data = ctx };
+			r_graph_dfs_node (ctx->cfg, n, &reach);
+			break;
+		}
+	}
+}
+
+static void mark_exception_reachable(RCore *core, PdcCtx *ctx) {
+	RBinFile *bf = r_bin_cur (core->bin);
+	const RVecRBinTrycatch *handlers = bf? r_bin_file_get_trycatch (bf): NULL;
+	if (!handlers) {
+		return;
+	}
+	const RBinTrycatch *tc;
+	R_VEC_FOREACH (handlers, tc) {
+		mark_exception_entry (ctx, tc->handler);
+		mark_exception_entry (ctx, tc->filter);
 	}
 }
 
@@ -635,8 +667,16 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 		.reachable = r_config_get_b (core->config, "pdc.reachable")? ht_uu_new0 (): NULL,
 		.decisions = r_config_get_b (core->config, "pdc.prove")
 			&& r_config_get_b (core->config, "pdc.reachable")? ht_uu_new0 (): NULL,
+		.owned = r_config_get_b (core->config, "pdc.reachable")? ht_up_new0 (): NULL,
 		.cap = 4 * (int)RVecAnalBlockPtr_length (&fcn->bbs) + 64
 	};
+
+	if (ctx.owned) {
+		RAnalBlock **it;
+		R_VEC_FOREACH (&fcn->bbs, it) {
+			ht_up_insert (ctx.owned, (*it)->addr, *it);
+		}
+	}
 
 	if (ctx.decisions) {
 		RListIter *it;
@@ -666,11 +706,10 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 		}
 	}
 
-	// Acyclic CFGs never need a dominator tree for natural-loop detection.
-	RGraphVisitor vis = { .back_edge = back_edge_cb,
-		.discover_node = ctx.reachable? mark_reachable: NULL, .data = &ctx };
-	r_graph_dfs_node (g, entry, &vis);
 	if (ctx.reachable) {
+		RGraphVisitor reach = { .discover_node = mark_reachable, .data = &ctx };
+		r_graph_dfs_node (g, entry, &reach);
+		mark_exception_reachable (core, &ctx);
 		RVecGraphNodePtr unreachable;
 		RVecGraphNodePtr_init (&unreachable);
 		RListIter *it;
@@ -684,6 +723,10 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 		r_graph_del_nodes (g, &unreachable);
 		RVecGraphNodePtr_fini (&unreachable);
 	}
+
+	// Do not admit disconnected predecessors into a live natural-loop set.
+	RGraphVisitor loops = { .back_edge = back_edge_cb, .data = &ctx };
+	r_graph_dfs_node (g, entry, &loops);
 
 	// add a virtual sink (addr UT64_MAX reads as "past function exit") so
 	// post-dominance is well-defined on multi-exit functions
@@ -739,6 +782,7 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 	ht_uu_free (ctx.dom_post);
 	ht_uu_free (ctx.ipdom);
 	ht_uu_free (ctx.decisions);
+	ht_up_free (ctx.owned);
 	ht_up_foreach (ctx.loops, free_loop_set_cb, NULL);
 	ht_up_free (ctx.loops);
 	if (root) {

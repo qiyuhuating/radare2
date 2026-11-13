@@ -34,6 +34,7 @@ typedef struct pdc_state_t {
 	RBitset *switch_addrs;
 	bool named_gotos; // structured walk done: a goto out of the function reads as its name
 	RAnalFunction *fcn;
+	HtUU *reachable; // borrowed from a prebuilt structuring plan during emulation
 	ut64 bb_jump; // edges of the block being rendered, owned by its region in structured mode
 	ut64 bb_fail;
 	HtUP *conds; // block addr => recovered condition, recovered once per block
@@ -1054,7 +1055,8 @@ static char *fetch_bb_pseudo(PDCState *state, RAnalBlock *bb) {
 // a block the walk still owes: unvisited and belonging to the function
 static RAnalBlock *pending_block(PDCState *state, RBitset *vis, ut64 addr) {
 	RAnalBlock *bb = r_anal_get_block_at (state->core->anal, addr);
-	if (!bb || r_bitset_test (vis, addr) || !r_list_contains (bb->fcns, state->fcn)) {
+	if (!bb || r_bitset_test (vis, addr) || !r_list_contains (bb->fcns, state->fcn)
+			|| (state->reachable && !ht_uu_find (state->reachable, bb->addr, NULL))) {
 		return NULL;
 	}
 	return bb;
@@ -1154,6 +1156,10 @@ static void pdc_emulate_blocks(PDCState *state) {
 		bb = *iter;
 		// a seed left behind by another command would outrank the walk
 		R_FREE (bb->parent_reg_arena);
+		// Detached bytes are never needed by a verified reachable-only plan.
+		if (state->reachable && !ht_uu_find (state->reachable, bb->addr, NULL)) {
+			continue;
+		}
 		// stores may hit code; disassemble the bytes as they were
 		ut8 *buf = malloc (bb->size);
 		if (buf) {
@@ -1164,7 +1170,8 @@ static void pdc_emulate_blocks(PDCState *state) {
 	emulate_dfs (state, vis, bytes, saved, len);
 	R_VEC_FOREACH (&state->fcn->bbs, iter) {
 		bb = *iter;
-		if (!r_bitset_test (vis, bb->addr)) {
+		if (!r_bitset_test (vis, bb->addr)
+				&& (!state->reachable || ht_uu_find (state->reachable, bb->addr, NULL))) {
 			r_bitset_set (vis, bb->addr);
 			emulate_block (state, bb, bytes, saved, len);
 		}
@@ -2354,8 +2361,8 @@ static bool regions_have_blocks(PDCState *state, PdcRegion *r) {
 }
 
 // renders the whole function from the region AST, or returns false to defer to the linear pass
-static bool pdc_structured_body(PDCState *state, int indent) {
-	PdcPlan *plan = pdc_plan_build (state->core, state->fcn);
+static bool pdc_structured_body(PDCState *state, int indent, PdcPlan *prepared) {
+	PdcPlan *plan = prepared? prepared: pdc_plan_build (state->core, state->fcn);
 	if (!plan || !plan->root) {
 		pdc_plan_free (plan);
 		return false;
@@ -2481,7 +2488,17 @@ static bool pdc_decompile_function(RCore *core, const char *input, PDCState *par
 	state.bbtext = ht_up_new (NULL, kvfree, NULL);
 	r_io_cache_push (core->io);
 	r_core_cmd0 (core, "aeim");
+	PdcPlan *prepared = NULL;
+	if (r_config_get_b (core->config, "pdc.structured")
+			&& r_config_get_b (core->config, "pdc.reachable")) {
+		prepared = pdc_plan_build (core, state.fcn);
+		if (prepared && prepared->root && prepared->complete
+				&& regions_have_blocks (&state, prepared->root)) {
+			state.reachable = prepared->reachable;
+		}
+	}
 	pdc_emulate_blocks (&state);
+	state.reachable = NULL;
 
 	r_strf_buffer (64);
 	RAnalBlock *bb = r_anal_function_bbget_at (core->anal, state.fcn, state.fcn->addr);
@@ -2552,7 +2569,7 @@ static bool pdc_decompile_function(RCore *core, const char *input, PDCState *par
 	RList *visited = r_list_newf (NULL);
 	state.last_addr = state.fcn->addr;
 	const bool structured = r_config_get_b (core->config, "pdc.structured")
-		&& pdc_structured_body (&state, indent);
+		&& pdc_structured_body (&state, indent, prepared);
 	if (structured) {
 		bb = NULL;
 	}

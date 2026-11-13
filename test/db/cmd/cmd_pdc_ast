@@ -574,3 +574,68 @@ seq 0x00000000
   bb 0x0000000e
 EOF
 RUN
+
+NAME=pdc reachable and proof modes retain exception-handler successor paths
+FILE=bins/elf/0pack
+CMDS=<<EOF
+e scr.color=false
+af @ 0x4779b4
+e pdc.reachable=true
+pdco @ 0x4779b4~__cxa_begin_catch
+?e --
+e pdc.prove=true
+pdco @ 0x4779b4~__cxa_begin_catch
+EOF
+EXPECT=<<EOF
+ 0x004779e9 |         sym.imp.__cxa_begin_catch ()
+ 0x00477a1c |         sym.imp.__cxa_begin_catch ()
+--
+ 0x004779e9 |         sym.imp.__cxa_begin_catch ()
+ 0x00477a1c |         sym.imp.__cxa_begin_catch ()
+EOF
+RUN
+
+NAME=pdct reachable does not enter a block owned by a nested function
+FILE=malloc://128
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+af+ 0 outer
+afb+ 0 0 0x14 0x14
+afb+ 0 0x20 4
+af+ 0x14 inner
+afb+ 0x14 0x14 4 0x20
+s 0
+e pdc.reachable=true
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  goto 0x00000014
+EOF
+RUN
+
+NAME=pdct detached predecessor never enters the live loop membership
+FILE=malloc://256
+ARGS=-a x86 -b 64
+CMDS=<<EOF
+e pdc.optimize=false
+af+ 0 demo
+afb+ 0 0 4 0xffffffffffffffff 0x10
+afb+ 0 0x10 4 0x20 0x30
+afb+ 0 0x20 4 0x10
+afb+ 0 0x30 4
+afb+ 0 0x40 4 0x44
+afb+ 0 0x44 4 0x20
+s 0
+e pdc.reachable=true
+pdct
+EOF
+EXPECT=<<EOF
+seq 0x00000000
+  bb 0x00000000
+  while 0x00000010
+    bb 0x00000020
+  bb 0x00000030
+EOF
+RUN
