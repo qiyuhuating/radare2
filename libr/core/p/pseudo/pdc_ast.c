@@ -165,6 +165,9 @@ static void ensure_dom_intervals(PdcCtx *ctx) {
 	}
 	ctx->dom_pre = ht_uu_new0 ();
 	ctx->dom_post = ht_uu_new0 ();
+	if (!ctx->dom_pre || !ctx->dom_post) {
+		return;
+	}
 	RGraphVisitor dom_vis = { .discover_node = mark_dom_enter,
 		.finish_node = mark_dom_leave, .data = ctx };
 	RListIter *it;
