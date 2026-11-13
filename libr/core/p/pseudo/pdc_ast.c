@@ -610,7 +610,8 @@ static bool proof_branch(RCore *core, RAnalBlock *bb, bool *taken) {
 	PdcProof p = {0};
 	bool proved = false;
 	ut64 off = 0;
-	for (int i = 0; i < 32 && off < bb->size; i++) {
+	int i;
+	for (i = 0; i < 32 && off < bb->size; i++) {
 		RAnalOp *op = r_core_anal_op (core, bb->addr + off,
 			R_ARCH_OP_MASK_ESIL | R_ARCH_OP_MASK_DISASM);
 		if (!op || op->size < 1 || op->size > bb->size - off || op->delay) {
