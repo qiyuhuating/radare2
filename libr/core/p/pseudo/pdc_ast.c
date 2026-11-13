@@ -468,8 +468,10 @@ static void mark_exception_entry(PdcCtx *ctx, ut64 addr) {
 	r_list_foreach (ctx->cfg->nodes, it, n) {
 		RAnalBlock *bb = n->data;
 		if (addr >= bb->addr && addr - bb->addr < bb->size) {
-			RGraphVisitor reach = { .discover_node = mark_reachable, .data = ctx };
-			r_graph_dfs_node (ctx->cfg, n, &reach);
+			if (!htuu_get (ctx->reachable, bb->addr, 0)) {
+				RGraphVisitor reach = { .discover_node = mark_reachable, .data = ctx };
+				r_graph_dfs_node (ctx->cfg, n, &reach);
+			}
 			break;
 		}
 	}
@@ -486,6 +488,12 @@ static void mark_exception_reachable(RCore *core, PdcCtx *ctx) {
 		mark_exception_entry (ctx, tc->handler);
 		mark_exception_entry (ctx, tc->filter);
 	}
+}
+
+static void mark_known_reachable(RCore *core, PdcCtx *ctx) {
+	RGraphVisitor reach = { .discover_node = mark_reachable, .data = ctx };
+	r_graph_dfs_node (ctx->cfg, ctx->entry, &reach);
+	mark_exception_reachable (core, ctx);
 }
 
 // Prove only local x86 zero-flag branches; unmodelled instructions are unknown.
@@ -703,13 +711,19 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 		}
 	}
 
+	if (ctx.reachable) {
+		// The unmodified CFG bounds which blocks are worth decoding.
+		mark_known_reachable (core, &ctx);
+	}
+
+	bool reduced = false;
 	if (ctx.decisions) {
 		RListIter *it;
 		RGraphNode *n;
 		r_list_foreach (g->nodes, it, n) {
 			RAnalBlock *bb = n->data;
 			bool taken;
-			if (!proof_branch (core, bb, &taken)) {
+			if (!htuu_get (ctx.reachable, bb->addr, 0) || !proof_branch (core, bb, &taken)) {
 				continue;
 			}
 			const ut64 target = taken? bb->jump: bb->fail;
@@ -727,14 +741,18 @@ PdcPlan *pdc_plan_build(RCore *core, RAnalFunction *fcn) {
 			if (kept && dropped) {
 				r_graph_del_edge (g, n, dropped);
 				ht_uu_update (ctx.decisions, bb->addr, target);
+				reduced = true;
 			}
 		}
 	}
 
 	if (ctx.reachable) {
-		RGraphVisitor reach = { .discover_node = mark_reachable, .data = &ctx };
-		r_graph_dfs_node (g, entry, &reach);
-		mark_exception_reachable (core, &ctx);
+		if (reduced) {
+			// A proven edge can make its former successor unreachable.
+			ht_uu_free (ctx.reachable);
+			ctx.reachable = ht_uu_new0 ();
+			mark_known_reachable (core, &ctx);
+		}
 		RVecGraphNodePtr unreachable;
 		RVecGraphNodePtr_init (&unreachable);
 		RListIter *it;
